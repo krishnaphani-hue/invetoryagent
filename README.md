@@ -1,115 +1,326 @@
-# Inventory Agent
+# Asset Inventory Server
 
-A background Windows service that records what is running on a machine and stores it in PostgreSQL.
-Written in C++17 against the Win32 API, with UTF-8 used for all text that leaves the process.
+Collects inventory from Windows machines (installed software, listening ports, processes, services) and shows it
+in a web dashboard.
 
-Every cycle (default 5 minutes) it collects:
+- **Agents** (the Inventory Agent, or any other collector) send JSON to `POST /api/v1/inventory`.
+- **Excel upload:** for machines without an agent, upload an `.xlsx` file on the dashboard's Upload page.
+- Every delivery is kept as a **snapshot**, so history is preserved (30 days by default). The dashboard shows each
+  machine's current state and any past snapshot.
 
-| Data | Fields |
+| Document | For |
 |---|---|
-| Windows services | name, display name, status, start type |
-| Running processes | name, PID, executable path, file version |
-| Listening ports | protocol (TCP/TCP6/UDP/UDP6), address, port, owning PID, application, path, version |
-| Installed software | name, version, publisher (registry uninstall keys, 64-bit and 32-bit) |
+| **README.md** (this file) | Setting up, running, testing and deploying the server |
+| [docs/DESIGN.md](docs/DESIGN.md) | How the system works: architecture, data model, decisions, future work |
+| [docs/COLLECTOR_API.md](docs/COLLECTOR_API.md) | Agent developers: what to send, which API to call, how to handle responses |
 
-Each row carries a machine ID and a collection timestamp, so you can query any machine at any point in time.
+> **No login yet.** Anyone who can reach the server can view the dashboard and upload files. Keep it on a trusted
+> network and use test data until authentication is added.
 
-See [docs/DESIGN.md](docs/DESIGN.md) for architecture and design decisions.
+**Stack:** Python 3.12 · FastAPI · SQLAlchemy 2 · Alembic · PostgreSQL · React 19 · MUI 9 · Vite · TypeScript.
+No Docker needed.
 
-## Requirements
+## Quick start
 
-- Windows 10/11 x64 (tested on Windows 11)
-- To build: Visual Studio 2022 Build Tools (C++ workload) and PostgreSQL 16 (for `libpq` headers and libraries)
-- To run: a reachable PostgreSQL server and `libpq.dll` with its dependencies beside the exe (`build.bat` copies them)
-
-## Build
+Install once, yourself: **PostgreSQL 16+** (service running), **Python 3.10+** and **Node.js 20+**. To also run the
+agent you need Visual Studio or the Build Tools with the "Desktop development with C++" workload (the agent is
+compiled from `agent/`); without it the server and dashboard still run.
 
 ```bat
-build.bat
+git clone <repo>
+cd asset-inventory-server
+run.bat
 ```
 
-Output goes to `out\`: `InventoryAgent.exe`, `config.ini` and the libpq DLLs. Run `build.bat` from this folder.
+`run.bat` needs no administrator rights and installs nothing system-wide. It creates `.env` (random passwords),
+the databases, the Python environment and the dashboard build, builds the agent, then starts the **server** and
+the **Inventory Agent** in the background and opens http://localhost:8080. The only question it can ask is the
+PostgreSQL `postgres` password, once, to create the databases. Later runs just start things; `stop.bat` stops the
+server and the agent (PostgreSQL is never touched). Logs and the agent's buffer are in `.data\`.
 
-## Set up the database
+Options: `run.bat -NoBrowser`, `run.bat -SkipAgent`. The agent collects every 5 minutes and the server imports it
+every 5 minutes (`AGENT_POLL_MINUTES` in `.env`). The steps below are the manual route.
 
-New database (run as the `postgres` superuser):
+## Contents
 
+1. [Prerequisites](#1-prerequisites)
+2. [First-time setup](#2-first-time-setup)
+3. [Running the app](#3-running-the-app)
+4. [Loading test data](#4-loading-test-data)
+5. [Running the tests](#5-running-the-tests)
+6. [Configuration](#6-configuration-env)
+7. [Letting other machines connect](#7-letting-other-machines-connect)
+8. [Deploying to a server](#8-deploying-to-a-server)
+9. [Troubleshooting](#9-troubleshooting)
+10. [Project layout](#10-project-layout)
+
+## 1. Prerequisites
+
+Windows 10/11 with:
+
+| Tool | Version | Notes |
+|---|---|---|
+| Python | 3.12 | `python` must be on PATH |
+| Node.js | 22 or newer (tested with 26) | Includes `npm` |
+| PostgreSQL | 16 or newer (tested with 19) | Installer from postgresql.org. This repo assumes **port 5433**; change `DATABASE_URL` if yours differs. Remember the `postgres` password you set during install. |
+| Git | any | |
+
+pgAdmin (installed with PostgreSQL) is useful for looking at the data but not required.
+
+## 2. First-time setup (manual; `run.bat` does this for you)
+
+From the repo root in PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\setup_db.ps1
 ```
-psql -U postgres -f schema.sql
+
+The script:
+
+1. Creates `.env` from `.env.example`, with a random password for the app's own database user (skipped if
+   `.env` already exists).
+2. Connects as `postgres` (**asks for that password once**) and creates the user `inventory_app` and two
+   databases: `asset_inventory` (the app) and `asset_inventory_test` (used only by the tests).
+3. Creates the Python virtual environment `backend\.venv`, installs the requirements, and creates the tables
+   (`alembic upgrade head`).
+
+You can run it again safely; it only creates what's missing. The frontend packages (`npm install`) are installed
+automatically the first time you run the app.
+
+## 3. Running the app
+
+There are two modes. Both use the same code; they differ only in who serves the dashboard.
+
+### Run mode: one process, one port (demos, servers)
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\run.ps1
 ```
 
-Existing database from an earlier version (adds the `listening_ports` table and `processes.version`):
-
-```
-psql -U postgres -d inventory -f migrate_ports.sql
-```
-
-`schema.sql` creates the `inventory` database, the tables, and a limited `agent` user with
-INSERT, UPDATE and SELECT only. **Change the `change_me` password** in `schema.sql` and `config.ini`.
-
-## Install
-
-Double-click `out\InventoryAgent.exe`. Windows asks for administrator rights, then a dialog offers to install.
-Installing copies the files to `C:\Program Files\InventoryAgent`, registers the `InventoryAgent` service
-(automatic start, restart on failure) and starts it. Running it again offers reinstall or uninstall.
-
-Command line equivalents (run from an elevated shell):
-
-| Command | Effect |
+| | URL |
 |---|---|
-| `InventoryAgent.exe --setup` | Open the setup dialog |
-| `InventoryAgent.exe --install` | Install or update the service without a dialog |
-| `InventoryAgent.exe --uninstall` | Stop and remove the service (data and files are kept) |
-| `InventoryAgent.exe --console` | Run in the foreground and log to the console; stop with Ctrl+C |
+| Dashboard | http://localhost:8080 |
+| API | http://localhost:8080/api/v1/... |
+| API docs (Swagger) | http://localhost:8080/api/docs |
 
-## Configure
+What it does: builds the dashboard into static files (`npm run build` → `frontend/dist`), updates the database
+tables, then starts the server with `python -m app`. FastAPI serves both the dashboard files and the API on one
+port. Stop it with `Ctrl+C`.
 
-Edit `config.ini` beside the installed exe, then restart the service. The file is UTF-8; lines starting with `#` are comments.
+### Dev mode: live reload while you change code
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\dev.ps1
+```
+
+Opens two windows:
+
+| Window | URL | Reloads on save |
+|---|---|---|
+| Dashboard (Vite dev server) | http://localhost:5173 | React/TypeScript changes |
+| API (uvicorn `--reload`) | http://localhost:8000/api/docs | Python changes |
+
+Vite forwards every `/api` request from 5173 to 8000, so the browser only talks to one address.
+
+### How the dashboard finds the API
+
+The dashboard calls the API with relative URLs (`/api/v1/...`), so it always uses the address it was loaded from.
+There is no API URL to configure and no CORS setup, in any mode or environment.
+
+## 4. Loading test data
+
+The dashboard starts empty. With the app running (run mode, port 8080):
+
+**Fake agent.** It sends realistic data in the same format as a real agent:
+
+```powershell
+backend\.venv\Scripts\python.exe tools\fake_collector.py --machines 5 --runs 3
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--url` | `http://localhost:8080` | Server address (use `http://localhost:8000` in dev mode) |
+| `--machines` | 3 | Number of machines. The first 3 are detailed samples, the rest are generated. |
+| `--runs` | 1 | Deliveries per machine. Versions change slightly between runs. `0` = forever. |
+| `--interval` | 2 | Seconds between runs |
+| `--api-key` | `INGEST_API_KEY` from `.env` | Sent as `X-API-Key` |
+
+**Excel upload.** Open the dashboard's **Upload Excel** page and drop in
+[samples/sample_inventory.xlsx](samples/sample_inventory.xlsx) (3 machines). To regenerate the file:
+`backend\.venv\Scripts\python.exe tools\make_sample_excel.py`. The workbook format is described in
+[docs/DESIGN.md](docs/DESIGN.md#52-excel-upload).
+
+**Real data from the Inventory Agent's own database.** The agent currently writes to its own PostgreSQL database
+instead of calling this API. Until it switches, the server can read that database itself: set `AGENT_DB_URL` in
+`.env` (and `ONLINE_MINUTES` above `AGENT_POLL_MINUTES`) and restart. Every `AGENT_POLL_MINUTES` (default 30) it
+imports the cycles collected since the last import, without duplicates. `GET /api/health` shows the last poll and
+any error. The dashboard refreshes its data every 5 minutes.
+
+To copy data once by hand instead (for example older history):
+
+```powershell
+backend\.venv\Scripts\python.exe tools\import_from_agent_db.py --agent-db "postgresql://agent:<password>@localhost:5432/inventory" --latest-only
+```
+
+`--latest-only` imports only the newest collection per machine; `--since 2026-11-20` imports everything from that
+date. Running it twice imports the same data twice.
+
+## 5. Running the tests
+
+```powershell
+cd backend
+.\.venv\Scripts\python.exe -m pytest -q                                          # all tests
+.\.venv\Scripts\python.exe -m pytest tests\test_excel.py::test_missing_hostname -q  # one test
+```
+
+The tests use the `asset_inventory_test` database (the `DATABASE_URL` database name plus `_test`) and empty it
+before every test. They never touch the real `asset_inventory` data.
+
+Frontend type check and build:
+
+```powershell
+cd frontend
+npm run build
+```
+
+## 6. Configuration (`.env`)
+
+All settings live in `.env` in the repo root (created by the setup script; never commit it). Defaults are in
+`.env.example`.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `ConnectionString` | local `inventory` DB as `agent` | libpq connection string |
-| `IntervalMinutes` | `5` | Minutes between collections (minimum 1) |
-| `CollectInstalledSoftware` | `true` | Set `false` to skip the registry software scan |
-| `BufferDirectory` | `C:\ProgramData\InventoryAgent\buffer` | Where snapshots wait when the database is down |
+| `DATABASE_URL` | `postgresql+psycopg://inventory_app:<pw>@localhost:5433/asset_inventory` | App database. The tests use the same server with `_test` appended to the database name. |
+| `HOST` | `127.0.0.1` | Where the server listens. `127.0.0.1` = this computer only. `0.0.0.0` = other machines can connect. |
+| `APP_PORT` | `8080` | Port for run mode (`run.ps1` / `python -m app`) |
+| `INGEST_API_KEY` | empty | If set, agents must send it in the `X-API-Key` header. Empty = no key needed. |
+| `RETENTION_DAYS` | `30` | How many days of snapshots to keep. `0` = keep forever. |
+| `ONLINE_MINUTES` | `15` | A machine is shown as online if it sent data within this many minutes |
+| `MAX_UPLOAD_MB` | `20` | Largest Excel file accepted |
+| `AGENT_DB_URL` | empty | libpq URL of the agent's own database, e.g. `postgresql://agent:<pw>@localhost:5432/inventory`. Set = poll it and import new cycles. Empty = no polling. |
+| `AGENT_POLL_MINUTES` | `30` | How often the agent database is polled. Keep `ONLINE_MINUTES` above it (e.g. 35). |
+| `PG_BIN` | newest folder under `C:\Program Files\PostgreSQL` | Optional. Folder with `psql.exe`, used only by `setup_db.ps1`. |
 
-Logs are written to `C:\ProgramData\InventoryAgent\agent.log`.
+Restart the server after changing `.env`.
 
-## View the data
+Generate a key for `INGEST_API_KEY`:
 
-- `.\view.ps1` prints the latest inventory as tables (needs `psql`).
-- Or use pgAdmin 4 and open the `inventory` database.
-
-Useful queries:
-
-```sql
--- Listening ports with the application and version
-select protocol, port, process_name as application, version, path, pid
-from listening_ports
-where collected_at = (select max(collected_at) from listening_ports)
-order by port, protocol;
-
--- Currently running services
-select name, display_name, start_type from services
-where collected_at = (select max(collected_at) from services) and status = 'Running';
+```powershell
+backend\.venv\Scripts\python.exe -c "import secrets; print(secrets.token_urlsafe(24))"
 ```
 
-## Project layout
+## 7. Letting other machines connect
 
-| File | Purpose |
+By default (`HOST=127.0.0.1`) only your own computer can reach the server. An agent installed on the same machine
+sends to `http://localhost:8080`, and nothing is exposed to the network.
+
+| | Local (default) | Network demo | Hosted server |
+|---|---|---|---|
+| `HOST` | `127.0.0.1` | `0.0.0.0` | `127.0.0.1` (nginx in front) |
+| `INGEST_API_KEY` | empty | set one | set one |
+| Agents send to | `http://localhost:8080` | `http://<this-pc-ip>:8080` | `https://<your-domain>` |
+| Also needed | nothing | a firewall rule (below) | see [section 8](#8-deploying-to-a-server) |
+
+For a network demo, allow port 8080 through Windows Firewall (admin PowerShell, needs permission on a managed laptop):
+
+```powershell
+New-NetFirewallRule -DisplayName "Asset Inventory 8080" -Direction Inbound -Protocol TCP -LocalPort 8080 -Action Allow -Profile Domain,Private
+```
+
+Find your IP with `ipconfig`. Windows blocks incoming connections on networks marked **Public**. Set the network to
+Private, or use a Domain network.
+
+`INGEST_API_KEY` protects only agent deliveries. The dashboard and Excel upload stay open until login is added: a
+key built into the web page would be visible to anyone who opens it.
+
+## 8. Deploying to a server
+
+On a server the app runs exactly as in run mode. nginx in front adds HTTPS and forwards every request unchanged, so
+URLs keep the same paths:
+
+```
+Agents + browsers ──https──> nginx (443) ──http──> app on 127.0.0.1:8080 ──> PostgreSQL
+```
+
+- **nginx** only handles HTTPS. It runs as an operating-system service and reads
+  [deploy/nginx.conf](deploy/nginx.conf) after you copy it to `/etc/nginx/conf.d/`.
+- **The app** must be kept running by a service manager: a systemd unit on Linux, or a Windows service (for example
+  with NSSM) on Windows. The service runs `python -m app` from the `backend` folder.
+- **PostgreSQL** runs as its own service (Linux default port 5432; set `DATABASE_URL` accordingly).
+
+### Option A: without Docker (recommended)
+
+Same steps as on the laptop, using Linux equivalents:
+
+1. Install PostgreSQL, Python 3.12, Node.js 22+ and nginx (e.g. `sudo apt install postgresql nginx python3-venv nodejs npm`).
+2. As `postgres`, run [backend/scripts/setup_db.sql](backend/scripts/setup_db.sql) with a password for the app user:
+   `sudo -u postgres psql -v app_password='<pw>' -f backend/scripts/setup_db.sql`
+3. Create `.env` from `.env.example`: set `DATABASE_URL` (port 5432 and the password), `HOST=127.0.0.1` and an
+   `INGEST_API_KEY`.
+4. Build and migrate:
+   ```bash
+   cd frontend && npm ci && npm run build && cd ..
+   cd backend && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt && .venv/bin/python -m alembic upgrade head
+   ```
+5. Create a systemd service that runs `/path/to/backend/.venv/bin/python -m app` with `WorkingDirectory=/path/to/backend`
+   and `Restart=always`, then `sudo systemctl enable --now asset-inventory`.
+6. Copy `deploy/nginx.conf` to `/etc/nginx/conf.d/asset-inventory.conf`, set `server_name` and the certificate paths,
+   then `sudo nginx -t && sudo systemctl reload nginx`.
+
+To update: `git pull`, repeat step 4, then `sudo systemctl restart asset-inventory`.
+
+### Option B: Docker (untested)
+
+[deploy/Dockerfile](deploy/Dockerfile) and [deploy/docker-compose.yml](deploy/docker-compose.yml) are for a Linux
+server where Docker is allowed. They have **not been tested**; Docker isn't used on the development laptop.
+
+```bash
+export POSTGRES_PASSWORD='<strong password>' INGEST_API_KEY='<key>'
+docker compose -f deploy/docker-compose.yml up -d --build
+```
+
+This starts PostgreSQL and the app (it runs migrations on start). The app is published on `127.0.0.1:8080` only, so
+nginx on the host (step 6 above) is still needed. Data lives in the `pgdata` Docker volume. Back it up with
+`docker compose -f deploy/docker-compose.yml exec db pg_dump -U inventory_app asset_inventory > backup.sql`.
+
+## 9. Troubleshooting
+
+| Problem | Fix |
 |---|---|
-| `main.cpp` | The whole agent: collectors, SQL builder, uploader, service and setup code |
-| `build.bat` | MSVC build script |
-| `InventoryAgent.manifest` | Sets the process code page to UTF-8 |
-| `config.ini` | Settings template |
-| `schema.sql` | Full database setup |
-| `migrate_ports.sql` | Upgrade for databases created before ports were added |
-| `view.ps1` | Prints the latest data as tables |
-| `docs/DESIGN.md` | Design document |
+| `npm is not recognized` | The scripts reload PATH themselves. In a manual shell, open a new terminal, or restart VS Code after installing Node.js. |
+| `setup_db.ps1`: `password authentication failed for user "postgres"` | Use the password you chose in the PostgreSQL installer. |
+| `setup_db.ps1`: `psql.exe not found` | Add `PG_BIN=<folder containing psql.exe>` to `.env`. |
+| Server won't start: port already in use | Another copy is running. Stop it, or change `APP_PORT`. Check with `Get-NetTCPConnection -LocalPort 8080`. |
+| Dashboard loads but shows no machines | No data yet; see [section 4](#4-loading-test-data). |
+| Other machines can't connect | `HOST=0.0.0.0` in `.env`, firewall rule added, network not set to Public; see [section 7](#7-letting-other-machines-connect). |
+| Agent gets `401` | Its key doesn't match `INGEST_API_KEY`. |
+| Dashboard shows an old version | In run mode the UI is rebuilt on every start of `run.ps1`; reload the page with `Ctrl+F5`. |
 
-## Known limitations
+## 10. Project layout
 
-- The database password is stored in plain text in `config.ini`. Restrict file permissions, or put an API in front of the database.
-- Each cycle stores a full snapshot, so tables grow quickly (about 900 rows per cycle on a typical PC).
-- Processes owned by other accounts hide their path from a non-elevated user. The service runs as LocalSystem and sees them.
-- The Windows `System` process (ports 139, 445, 5985) has no executable, so it has no version.
+```
+backend/
+  app/
+    main.py              FastAPI app; serves the API and the built dashboard
+    __main__.py          `python -m app`: starts uvicorn with HOST/APP_PORT from .env
+    config.py            settings from .env
+    db.py, models.py     database connection and tables
+    schemas.py           incoming JSON format (validation)
+    deps.py              API key check; ownership hooks for future login
+    routers/             ingest.py (agents), upload.py (Excel), read.py (dashboard)
+    services/            ingest.py (store a delivery), excel_parser.py, queries.py, retention.py
+  alembic/               database migrations
+  scripts/setup_db.sql   creates the database user and databases
+  tests/                 pytest tests
+  requirements.txt
+frontend/
+  src/                   React dashboard: api.ts (API calls), pages/, components/
+  vite.config.ts         dev server on 5173, forwards /api to 8000
+agent/                   Inventory Agent (C++): main.cpp, build.bat, schema.sql, config.ini (see agent/README.md)
+run.bat, stop.bat        start / stop the server and the agent (scripts/launch.ps1)
+scripts/                 launch.ps1, setup_db.ps1, run.ps1, dev.ps1
+tools/                   fake_collector.py, import_from_agent_db.py, make_sample_excel.py
+samples/                 sample_inventory.xlsx
+deploy/                  nginx.conf, Dockerfile, docker-compose.yml (for a future server)
+docs/                    DESIGN.md, COLLECTOR_API.md
+```

@@ -43,6 +43,13 @@ static std::wstring W(const std::string& s) {
 // ---------- paths, config, log ----------
 static std::wstring DataDir() {
     wchar_t buf[MAX_PATH];
+    // INVENTORY_AGENT_DATA keeps the log and buffer in a folder of your choice (run.bat uses .data\agent in the repo).
+    DWORD o = GetEnvironmentVariableW(L"INVENTORY_AGENT_DATA", buf, MAX_PATH);
+    if (o > 0 && o < MAX_PATH) {
+        std::wstring d(buf, o);
+        CreateDirectoryW(d.c_str(), nullptr);
+        return d;
+    }
     DWORD n = GetEnvironmentVariableW(L"ProgramData", buf, MAX_PATH);
     std::wstring d = n ? std::wstring(buf, n) : L"C:\\ProgramData";
     d += L"\\InventoryAgent";

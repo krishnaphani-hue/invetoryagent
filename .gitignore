@@ -1,6 +1,12 @@
-# build output
-out/
-*.obj
-*.exe
-*.dll
-*.pdb
+.env
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+node_modules/
+frontend/dist/
+*.tsbuildinfo
+*.log
+~$*.xlsx
+
+.data/
