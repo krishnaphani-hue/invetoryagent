@@ -129,6 +129,9 @@ New-Item -ItemType Directory -Force $data | Out-Null
 # ---------------------------------------------------------------- databases
 Step "Databases"
 function Test-Login([string]$user, [string]$pw, [string]$db) {
+    # Windows PowerShell 5.1 turns any native stderr into a terminating error under 'Stop' (even with 2>$null), so a
+    # failed login (expected on the first run, before the user exists) would abort the script. Local to this function.
+    $ErrorActionPreference = 'Continue'
     $old = $env:PGPASSWORD; $env:PGPASSWORD = $pw
     try { & $psql -U $user -h $pgHost -p $pgPort -d $db -tAc 'select 1' 2>$null | Out-Null; return ($LASTEXITCODE -eq 0) }
     finally { if ($null -eq $old) { Remove-Item Env:\PGPASSWORD -ErrorAction SilentlyContinue } else { $env:PGPASSWORD = $old } }
