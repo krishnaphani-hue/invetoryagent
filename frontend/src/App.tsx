@@ -8,6 +8,7 @@ import DashboardIcon from '@mui/icons-material/DashboardOutlined'
 import ComputerIcon from '@mui/icons-material/ComputerOutlined'
 import AppsIcon from '@mui/icons-material/AppsOutlined'
 import LanIcon from '@mui/icons-material/LanOutlined'
+import SecurityIcon from '@mui/icons-material/SecurityOutlined'
 import HistoryIcon from '@mui/icons-material/HistoryOutlined'
 import UploadIcon from '@mui/icons-material/UploadFileOutlined'
 import DarkIcon from '@mui/icons-material/DarkModeOutlined'
@@ -18,6 +19,7 @@ import Machines from './pages/Machines'
 import MachineDetail from './pages/MachineDetail'
 import Software from './pages/Software'
 import Ports from './pages/Ports'
+import Vulnerabilities from './pages/Vulnerabilities'
 import Snapshots from './pages/Snapshots'
 import Upload from './pages/Upload'
 
@@ -28,6 +30,7 @@ const NAV: { to: string; label: string; icon: ReactNode }[] = [
   { to: '/machines', label: 'Machines', icon: <ComputerIcon /> },
   { to: '/software', label: 'Software', icon: <AppsIcon /> },
   { to: '/ports', label: 'Ports', icon: <LanIcon /> },
+  { to: '/vulnerabilities', label: 'Vulnerabilities', icon: <SecurityIcon /> },
   { to: '/snapshots', label: 'Snapshots', icon: <HistoryIcon /> },
   { to: '/upload', label: 'Upload Excel', icon: <UploadIcon /> },
 ]
@@ -90,6 +93,7 @@ export default function App({ mode, onToggleMode }: { mode: 'light' | 'dark'; on
           <Route path="/machines/:id" element={<MachineDetail />} />
           <Route path="/software" element={<Software />} />
           <Route path="/ports" element={<Ports />} />
+          <Route path="/vulnerabilities" element={<Vulnerabilities />} />
           <Route path="/snapshots" element={<Snapshots />} />
           <Route path="/upload" element={<Upload />} />
           <Route path="*" element={<Navigate to="/" replace />} />

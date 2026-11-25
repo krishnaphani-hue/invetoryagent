@@ -1,6 +1,6 @@
 # Asset Inventory Server: Design
 
-Status: proof of concept · Last updated: 2026-11-24
+Status: proof of concept · Last updated: 2026-11-25
 
 Related: [README.md](../README.md) (setup and running) · [COLLECTOR_API.md](COLLECTOR_API.md) (agent API)
 
@@ -30,10 +30,11 @@ Data comes from two sources:
 - **Excel uploads.** For machines where no agent can be installed, someone fills in a workbook and uploads it.
 
 **In scope:** receiving and validating data, storing full history, a dashboard for current state and history,
-Excel import.
+Excel import, and (optional) matching the installed software against known vulnerabilities from the separate
+Advanced-Threat-Intelligence (ATI) app (section 5.4).
 
 **Not in scope yet:** user login and per-user visibility, comparing two snapshots, alerts (for example a new exposed
-port), vulnerability matching (CVE lookup), editing data in the dashboard.
+port), editing data in the dashboard.
 
 ## 2. Architecture
 
@@ -49,11 +50,15 @@ flowchart LR
         ST["Static files<br/>(built React app)"]
         RT["Retention task<br/>(daily cleanup)"]
         AP["Agent DB poller<br/>(every 30 min, optional)"] --> I
+        TI["Threat-intel matcher<br/>(hourly, optional)"]
     end
     ADB[("Agent's own DB<br/>inventory")] -. "read" .-> AP
+    ATI["Advanced-Threat-Intelligence<br/>(separate app)"] -. "GET /api/cves" .-> TI
+    NVD["NIST NVD API"] -. "affected version ranges" .-> TI
     I --> DB[("PostgreSQL")]
     Q --> DB
     RT --> DB
+    TI --> DB
 ```
 
 | Component | Technology | Role |
@@ -64,6 +69,7 @@ flowchart LR
 | Migrations | Alembic (hand-written) | Creates and changes tables |
 | Database | PostgreSQL 16+ | Storage. JSONB holds flexible fields. |
 | Excel parsing | openpyxl | Reads `.xlsx` uploads |
+| Threat intelligence | httpx; ATI (separate Python app) and the NVD API | Optional. CVE candidates and risk data from ATI, exact affected versions from NVD (section 5.4) |
 | Dashboard | React 19, TypeScript, MUI 9, MUI X DataGrid, TanStack Query, React Router, Vite | Web UI |
 
 **One process, one port.** In production the React app is built into static files, and FastAPI serves them next
@@ -214,6 +220,13 @@ Notes:
 **Exposed port:** a listening port whose `local_address` is not a loopback address (`127.*`, `::1`). It can be
 reached from the network, for example `0.0.0.0` or `::`.
 
+**Threat-intelligence tables** (migration `0002`; they hold derived data and can be rebuilt by a scan):
+
+| Table | Holds |
+|---|---|
+| `threat_matches` | One row per **application** (name + version) and CVE: status (`vulnerable` / `review` / `ruled_out`), the reason, the matched ATI vendor/product, the matching version range and fixed version, severity, CVSS, EPSS, CISA KEV and exploit flags, a short AI summary. Unique on (name, version, CVE). Not tied to a machine: the API joins it to each machine's *current* software, so every machine with that version gets the finding and a finding disappears the moment the version is no longer installed. |
+| `threat_cve_ranges` | Cache of the affected products and version ranges NVD lists for a CVE (JSONB list of `{vendor, product, version, start_incl, start_excl, end_incl, end_excl}`), with the fetch time. An empty list means NVD has not attached product data yet. |
+
 ## 5. Data inputs
 
 ### 5.1 Agent JSON
@@ -264,6 +277,53 @@ Today the agent writes each cycle into its own PostgreSQL database (`inventory`)
 
 This goes away once the agent POSTs to `/api/v1/inventory`; then `AGENT_DB_URL` is left empty.
 
+### 5.4 Threat intelligence (Advanced-Threat-Intelligence)
+
+ATI is a separate app that collects CVEs from NVD, the CISA KEV catalog, EPSS and exploit repositories into its own
+database and serves them over HTTP. It does not know what is installed on our machines (its asset-matching tables
+exist but nothing fills them). This server does that correlation. It is **optional**: it runs only when `ATI_URL`
+is set, ATI keeps its own code, database and port (use 8001 locally), and nothing is copied between the two repos.
+
+A scan (`services/threat_intel.py`) runs every `ATI_POLL_MINUTES` (default 60), or when someone presses **Scan now**:
+
+1. **Applications.** Take every distinct installed application (name, version, publisher) from the machines'
+   current software.
+2. **Candidates (ATI).** From the application name, take the word that identifies the product (the first word that is
+   not just the publisher's name; noise such as "Inc", "Runtime", "x64", "KB123456" is skipped). Ask ATI for CVEs
+   containing it (`GET /api/cves?search=`). Keep a CVE only if ATI's product contains that word **and** ATI's vendor
+   agrees with the publisher or the application name. This is where severity, CVSS, EPSS, CISA KEV, exploit flags and
+   the AI summary come from.
+3. **Affected versions (NVD).** Fetch each candidate CVE's affected products and version ranges from NVD
+   (`threat_cve_ranges` cache, `NVD_RANGE_TTL_DAYS`). At most `NVD_MAX_LOOKUPS` CVEs are fetched per scan, riskiest
+   first (CISA KEV, public exploit, CVSS), and requests are spaced to respect NVD's limit (5 per 30 s, 50 with
+   `NVD_API_KEY`). Scans converge over time; findings not yet checked show as `review`.
+4. **Decision.** Compare the installed version with every range NVD lists *for that product*, honouring both lower
+   and upper bounds and exact versions.
+
+| Status | Meaning |
+|---|---|
+| `vulnerable` | Installed version is inside an affected range and the product name matches well (every word of the name appears in ATI's vendor/product) |
+| `review` | Product matches but it cannot be decided: ranges not fetched yet, version unreadable, NVD has no product data for the CVE, the CVE's NVD product list lacks this application, or only part of the name matched |
+| `ruled_out` | Installed version is outside every affected range. Kept so analysts can see why a CVE was dropped; hidden from the default views. |
+
+**Why NVD for versions instead of ATI.** ATI reports one vulnerable range per CVE, taken from the first NVD entry
+that has an upper bound. Products with several release branches get wrong answers. Tested against real data:
+CVE-2024-10979 lists `>= 12.0, < 12.21`, `>= 13.0, < 13.17`, ... `>= 16.0, < 16.5`; ATI reports only `< 12.21`, which
+made PostgreSQL 16.2 look safe. Reading NVD directly flags it correctly (fixed in 16.5) and rules out 16.16.
+A false "safe" is the worst failure for this feature, so ranges are never taken from ATI.
+
+**Risk score (0 to 100)**, used to order findings: `CVSS × 5 + 30 (CISA KEV) + 15 (public exploit) + EPSS × 15`,
+capped at 100.
+
+**Ports.** Each finding lists the machine's current listening ports whose program path or name contains the
+application's product word (for example port 8080 served by a file under `...\Acrobat DC\...`), and whether any is
+exposed.
+
+**Failure behaviour.** If ATI is unreachable the scan fails, the error is shown on the page and in `/api/health`, and
+the previous findings are kept. If ATI's search fails for one word, the findings of the applications that use that word
+are kept. If NVD refuses a request (403/429) the scan stops fetching and finishes with what it has. A failed NVD fetch is
+not cached. Concurrent scans are refused (409).
+
 ## 6. API
 
 Base path `/api/v1`. Interactive documentation is at `/api/docs` (Swagger), and the schema at `/api/openapi.json`.
@@ -281,7 +341,11 @@ Base path `/api/v1`. Interactive documentation is at `/api/docs` (Swagger), and 
 | GET | `/snapshots/{id}` | One snapshot |
 | GET | `/software?q=` | Current software across all machines, grouped by name, publisher and version, with the list of machines |
 | GET | `/ports?q=&exposed_only=` | Current listening ports across all machines, grouped by protocol, port and process, with an exposed flag |
-| GET | `/api/health` | Health check (also checks the database connection); with `AGENT_DB_URL` set, also the last agent-DB poll |
+| GET | `/vulnerabilities?status=&machine_id=&q=&kev_only=&exploit_only=&severity=&limit=&offset=` | Findings, riskiest first: one row per machine, application and CVE, with risk, severity, CVSS, EPSS, KEV/exploit flags, version range, fixed version, matched ATI product, reason and tied listening ports. `status`: `actionable` (default: vulnerable + review), `vulnerable`, `review`, `ruled_out`, `all`. |
+| GET | `/vulnerabilities/summary?machine_id=` | Counts for findings that need action: findings, machines, applications, CVEs, vulnerable, review, KEV, exploit, by severity, top 10 CVEs |
+| GET | `/vulnerabilities/status` | Whether ATI is enabled, last scan time/result/error, cached ranges, stored findings |
+| POST | `/vulnerabilities/scan` | Start a scan now (202; 503 if `ATI_URL` is unset; 409 if one is running). Poll `/vulnerabilities/status`. |
+| GET | `/api/health` | Health check (also checks the database connection); with `AGENT_DB_URL` set, also the last agent-DB poll; with `ATI_URL` set, also the threat-intel status |
 
 ## 7. Dashboard
 
@@ -292,6 +356,7 @@ Base path `/api/v1`. Interactive documentation is at `/api/docs` (Swagger), and 
 | Machine detail | Snapshot picker (defaults to latest) and tabs for Software, Ports (exposed ports highlighted), Processes, Services |
 | Software | Fleet-wide software list. Each row expands to the machines that have it. |
 | Ports | Fleet-wide port list with an "exposed only" switch |
+| Vulnerabilities | Findings from the ATI matching (section 5.4): summary cards, filters (status, search, CISA KEV, public exploit), a table ordered by risk, and a detail dialog with the reason, matched ATI product, version range and the application's listening ports. **Scan now** starts a scan. Shows setup instructions when `ATI_URL` is unset. The Dashboard shows a "Vulnerable software" card when ATI is enabled. |
 | Snapshots | Every delivery: machine, source, file name, collected and received times, counts |
 | Upload Excel | Drag and drop an `.xlsx`, then see the result or the list of errors |
 
@@ -327,6 +392,9 @@ are untested, because Docker isn't approved on the development laptop. Steps are
 - The app's database user (`inventory_app`) owns only its own databases; the `postgres` superuser is used only during
   setup.
 - `.env` holds the database password and the key, and is excluded from git.
+- **Threat intelligence (optional):** the server makes outbound requests only to `ATI_URL` and the NVD API; nothing
+  from the inventory is sent to either (ATI gets a product word as a search term, NVD gets a CVE id). The findings
+  endpoints are as open as the rest of the dashboard until login exists. `NVD_API_KEY` is optional and goes in `.env`.
 
 **Planned (ownership-ready).** The code is already shaped for per-user visibility:
 
@@ -362,6 +430,10 @@ stay the same.
 | FastAPI serves the built dashboard | One process, one port, no CORS, no per-environment config | Separate web server or nginx locally |
 | PostgreSQL native on Windows, no Docker | Docker isn't approved on the development laptop | Docker Compose |
 | Sync SQLAlchemy and routes | Simpler code; load is low (one request per agent every 5 minutes) | Async stack |
+| ATI stays a separate app, used over HTTP | It has its own owner, code, database and release cycle (and no license file to copy under); the integration is one client module | Copy ATI into this repo; modify ATI to do the matching |
+| Affected versions from NVD, not from ATI | ATI keeps one range per CVE, which gives false "safe" results for multi-branch products (section 5.4) | Trust ATI's `vuln-version` endpoint |
+| Findings keyed by application, joined at read time | Same finding on every machine with that version; stale findings vanish when the version changes | One row per machine and CVE (more rows, goes stale) |
+| Show `ruled_out` and `review`, not only `vulnerable` | Name matching is heuristic; analysts need to see what was dropped and what is undecided | Show confirmed findings only |
 | Excel only, no CSV/JSON upload | One format that non-technical users can fill in; multiple sheets in one file | CSV per section |
 
 ## 12. Limitations and future work
@@ -371,8 +443,11 @@ stay the same.
 | Authentication | No login; optional shared agent key | Users, per-owner API keys, `scope_machines` filtering (section 9) |
 | Agent | Writes to its own database; the server polls it every 30 minutes (section 5.3) | Agent POSTs to this API ([COLLECTOR_API.md](COLLECTOR_API.md)) |
 | Comparisons | View any snapshot | Diff two snapshots: software added/removed/upgraded, ports opened/closed |
-| Alerts | none | New exposed port, unapproved software |
+| Alerts | none | New exposed port, unapproved software, a new CISA KEV finding |
 | Duplicates | Retries create duplicate snapshots | Idempotency key per delivery |
 | Python dependencies | Not version-pinned | Pin versions (or a lock file) before deploying |
 | Linux deployment | Documented steps; Docker files untested | Setup script and systemd unit once a server is chosen |
-| Multiple workers | One uvicorn process | With several workers, move the retention task to a scheduled job so it runs once |
+| Multiple workers | One uvicorn process | With several workers, move the retention task and the threat-intel scan to a scheduled job so they run once |
+| Product matching | By name (a product word plus vendor agreement), so look-alike names can match: for example "Visual C++ Redistributable" can match Visual Studio CVEs. The detail dialog shows the matched product. | Match on CPE identifiers (agent reads them, or a CPE dictionary lookup) |
+| CVEs without product data | ATI stores vendor/product "Unknown" for CVEs NVD has not analysed yet; they cannot be matched | Re-fetch in ATI later, or match on the CVE description |
+| Scan speed | At most `NVD_MAX_LOOKUPS` (15) NVD fetches per scan without a key, so the first full pass takes many scans | Set `NVD_API_KEY` and raise `NVD_MAX_LOOKUPS` |

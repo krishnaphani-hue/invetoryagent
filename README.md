@@ -53,6 +53,7 @@ every 5 minutes (`AGENT_POLL_MINUTES` in `.env`). The steps below are the manual
 8. [Deploying to a server](#8-deploying-to-a-server)
 9. [Troubleshooting](#9-troubleshooting)
 10. [Project layout](#10-project-layout)
+11. [Vulnerability matching with Advanced-Threat-Intelligence (optional)](#11-vulnerability-matching-with-advanced-threat-intelligence-optional)
 
 ## 1. Prerequisites
 
@@ -199,6 +200,11 @@ All settings live in `.env` in the repo root (created by the setup script; never
 | `MAX_UPLOAD_MB` | `20` | Largest Excel file accepted |
 | `AGENT_DB_URL` | empty | libpq URL of the agent's own database, e.g. `postgresql://agent:<pw>@localhost:5432/inventory`. Set = poll it and import new cycles. Empty = no polling. |
 | `AGENT_POLL_MINUTES` | `30` | How often the agent database is polled. Keep `ONLINE_MINUTES` above it (e.g. 35). |
+| `ATI_URL` | empty | Address of a running Advanced-Threat-Intelligence server, e.g. `http://127.0.0.1:8001`. Set = vulnerability matching on ([section 11](#11-vulnerability-matching-with-advanced-threat-intelligence-optional)). |
+| `ATI_POLL_MINUTES` | `60` | Minutes between automatic scans. `0` = only when you press **Scan now**. |
+| `NVD_API_KEY` | empty | Optional free NVD key: raises NVD's limit from 5 to 50 requests per 30 s. |
+| `NVD_MAX_LOOKUPS` | `15` | CVEs whose affected versions are fetched from NVD per scan (riskiest first). Raise it with a key. |
+| `NVD_RANGE_TTL_DAYS` | `7` | How long a CVE's fetched version ranges are reused. |
 | `PG_BIN` | newest folder under `C:\Program Files\PostgreSQL` | Optional. Folder with `psql.exe`, used only by `setup_db.ps1`. |
 
 Restart the server after changing `.env`.
@@ -307,8 +313,9 @@ backend/
     db.py, models.py     database connection and tables
     schemas.py           incoming JSON format (validation)
     deps.py              API key check; ownership hooks for future login
-    routers/             ingest.py (agents), upload.py (Excel), read.py (dashboard)
-    services/            ingest.py (store a delivery), excel_parser.py, queries.py, retention.py
+    routers/             ingest.py (agents), upload.py (Excel), read.py (dashboard), threat.py (vulnerabilities)
+    services/            ingest.py (store a delivery), excel_parser.py, queries.py, retention.py,
+                         agent_poller.py, threat_intel.py (match software against ATI + NVD)
   alembic/               database migrations
   scripts/setup_db.sql   creates the database user and databases
   tests/                 pytest tests
@@ -324,3 +331,51 @@ samples/                 sample_inventory.xlsx
 deploy/                  nginx.conf, Dockerfile, docker-compose.yml (for a future server)
 docs/                    DESIGN.md, COLLECTOR_API.md
 ```
+
+## 11. Vulnerability matching with Advanced-Threat-Intelligence (optional)
+
+The **Vulnerabilities** page shows which installed software is affected by known CVEs, per machine, ordered by risk
+(CVSS, CISA "known exploited", public exploit code, EPSS), with the listening ports of the affected application.
+It uses **Advanced-Threat-Intelligence (ATI)**, a separate app that collects CVEs. This server asks ATI which CVEs
+mention each installed product, then reads the exact affected versions from NVD and compares them with the installed
+version. Off by default; the rest of the dashboard works without it. How it decides is in
+[docs/DESIGN.md](docs/DESIGN.md#54-threat-intelligence-advanced-threat-intelligence).
+
+**1. Run ATI** (its own folder and virtual environment; its repo is separate from this one):
+
+```powershell
+git clone https://github.com/chiranjib2001/Advanced-Threat-Intelligence.git
+cd Advanced-Threat-Intelligence
+python -m venv .venv; .\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+python main.py --gui --port 8001       # port 8000 is used by this repo's dev mode
+```
+
+ATI starts with an empty database, so load CVEs before matching: use the **scan** controls in its web page at
+http://127.0.0.1:8001, or the CLI, for example `python main.py --cve CVE-2024-10979` for one CVE or
+`python main.py --active-week-exploits` for recent exploited ones (see ATI's own README). AI keys are optional; without
+them ATI skips its AI summaries and still stores CVEs, scores and exploit flags.
+
+**2. Point this server at it** (add to `.env`, then restart with `stop.bat` and `run.bat`):
+
+```
+ATI_URL=http://127.0.0.1:8001
+```
+
+Optional: `NVD_API_KEY` (free, from nvd.nist.gov) so scans can check many more CVEs.
+
+**3. Scan.** Open **Vulnerabilities** and press **Scan now** (it also runs every `ATI_POLL_MINUTES`). The first scans
+check at most `NVD_MAX_LOOKUPS` CVEs each, riskiest first; the page says how many are still waiting, and those
+findings show as **Needs review** until a later scan settles them. API:
+
+```powershell
+curl.exe -X POST http://localhost:8080/api/v1/vulnerabilities/scan
+curl.exe http://localhost:8080/api/v1/vulnerabilities/status
+curl.exe "http://localhost:8080/api/v1/vulnerabilities?status=vulnerable&kev_only=true"
+```
+
+Reading the results: **Vulnerable** = the installed version is inside an affected range NVD lists for that product.
+**Needs review** = the product matches but the version can't be decided yet. **Ruled out** = the version is outside
+every range (hidden by default). Products are matched by name, so click a row to check the matched product.
+
+Tests for this feature use a fake ATI and a fake NVD (no network): `cd backend; .\.venv\Scripts\python.exe -m pytest tests\test_threat_intel.py -q`.

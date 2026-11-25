@@ -80,6 +80,39 @@ export interface FleetPort {
   protocol: string | null; port: number; process_name: string | null; machine_count: number; exposed: boolean; machines: MachineRef[]
 }
 
+// ---------- threat intelligence (mirror backend/app/routers/threat.py) ----------
+export type VulnStatus = 'vulnerable' | 'review' | 'ruled_out'
+export interface PortRef { protocol: string | null; port: number; exposed: boolean }
+export interface Vulnerability {
+  machine_id: string; hostname: string | null
+  software_name: string; software_version: string | null; publisher: string | null
+  cve_id: string; status: VulnStatus; reason: string | null; risk: number
+  severity: string | null; cvss_v3: number | null; epss: number | null
+  is_cisa_kev: boolean; has_public_poc: boolean; has_metasploit: boolean; has_nuclei: boolean
+  vulnerable_range: string | null; fixed_version: string | null
+  matched_vendor: string | null; matched_product: string | null; ai_summary: string | null
+  exposed: boolean; ports: PortRef[]
+}
+export interface VulnFilters {
+  status: 'actionable' | VulnStatus | 'all'
+  kev_only: boolean
+  exploit_only: boolean
+  q: string
+}
+export interface VulnSummary {
+  findings: number; machines: number; applications: number; cves: number
+  vulnerable: number; review: number; kev: number; exploit: number
+  by_severity: Record<string, number>
+  top_cves: { cve_id: string; severity: string | null; cvss_v3: number | null; is_cisa_kev: boolean; risk: number; machines: number; software: string }[]
+}
+export interface ThreatStatus {
+  enabled: boolean; ati_url: string | null; poll_minutes: number; max_range_lookups: number
+  cached_ranges: number; stored_findings: number
+  running: boolean; last_run: string | null; last_error: string | null
+  last_result: { applications: number; candidate_cves: number; lookups: number; lookup_errors: number; lookups_pending: number
+                 vulnerable: number; review: number; ruled_out: number } | null
+}
+
 export interface UploadResult {
   filename: string
   snapshots: { snapshot_id: string; machine_id: string; hostname: string | null; collected_at: string; counts: Record<string, number | null> }[]
@@ -124,3 +157,26 @@ export const useFleetSoftware = () =>
 
 export const useFleetPorts = () =>
   useQuery({ queryKey: ['fleet-ports'], queryFn: () => get<{ items: FleetPort[] }>('/ports') })
+
+export const useVulnerabilities = (f: VulnFilters) =>
+  useQuery({
+    queryKey: ['vulnerabilities', f],
+    queryFn: () => get<{ total: number; items: Vulnerability[] }>('/vulnerabilities', {
+      status: f.status, kev_only: f.kev_only || undefined, exploit_only: f.exploit_only || undefined,
+      q: f.q || undefined, limit: 10000,
+    }),
+    placeholderData: keepPreviousData,
+  })
+
+export const useVulnSummary = () =>
+  useQuery({ queryKey: ['vulnerability-summary'], queryFn: () => get<VulnSummary>('/vulnerabilities/summary') })
+
+/** Polls faster while a scan is running. */
+export const useThreatStatus = () =>
+  useQuery({
+    queryKey: ['threat-status'],
+    queryFn: () => get<ThreatStatus>('/vulnerabilities/status'),
+    refetchInterval: (q) => (q.state.data?.running ? 3000 : 30000),
+  })
+
+export const startThreatScan = async () => (await http.post('/vulnerabilities/scan')).data

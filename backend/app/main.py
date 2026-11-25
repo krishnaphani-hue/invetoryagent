@@ -10,13 +10,17 @@ from sqlalchemy import text
 
 from app import db
 from app.config import settings
-from app.routers import ingest, read, upload
-from app.services import agent_poller
+from app.routers import ingest, read, threat, upload
+from app.services import agent_poller, threat_intel
 from app.services.retention import retention_loop
 
 
 def _agent_poll_enabled() -> bool:
     return bool(settings.agent_db_url) and settings.agent_poll_minutes > 0
+
+
+def _ati_loop_enabled() -> bool:
+    return bool(settings.ati_url) and settings.ati_poll_minutes > 0
 
 
 @asynccontextmanager
@@ -26,6 +30,8 @@ async def lifespan(app: FastAPI):
         tasks.append(asyncio.create_task(retention_loop()))
         if _agent_poll_enabled():
             tasks.append(asyncio.create_task(agent_poller.agent_poll_loop()))
+        if _ati_loop_enabled():
+            tasks.append(asyncio.create_task(threat_intel.ati_loop()))
     yield
     for task in tasks:
         task.cancel()
@@ -46,6 +52,7 @@ app = FastAPI(
 app.include_router(ingest.router)
 app.include_router(upload.router)
 app.include_router(read.router)
+app.include_router(threat.router)
 
 
 @app.get("/api/health", tags=["system"])
@@ -55,6 +62,8 @@ def health():
     result = {"status": "ok", "retention_days": settings.retention_days}
     if _agent_poll_enabled():
         result["agent_poll"] = {"every_minutes": settings.agent_poll_minutes, **agent_poller.status}
+    if settings.ati_url:
+        result["threat_intel"] = {"ati_url": settings.ati_url, "every_minutes": settings.ati_poll_minutes, **threat_intel.status}
     return result
 
 

@@ -7,6 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 A PoC server that stores Windows machine inventory (installed software, listening ports, processes, services) and
 shows it in a React dashboard. Data arrives from the C++ Inventory Agent in `agent/` (it writes to its
 own PostgreSQL database that the server polls, or can POST JSON to `/api/v1/inventory`) or from Excel uploads (`POST /api/v1/uploads`). No login yet.
+Optionally (`ATI_URL`), installed software is matched against CVEs from the separate Advanced-Threat-Intelligence (ATI)
+app and shown on a Vulnerabilities page (`services/threat_intel.py`, `routers/threat.py`).
 **No Docker on the dev laptop:** PostgreSQL runs natively on Windows on **port 5433**.
 
 ## Documentation (keep these three in sync with the code)
@@ -32,6 +34,7 @@ cd backend; .\.venv\Scripts\python.exe -m alembic revision -m "..."   # new migr
 cd frontend; npm run build                                      # tsc type-check + vite build
 backend\.venv\Scripts\python.exe tools\fake_collector.py --machines 5 --runs 3   # default URL :8080
 cd agent; cmd /c .\build.bat                                   # build the agent into agent\out (auto-detects PostgreSQL)
+cd backend; .\.venv\Scripts\python.exe -m pytest tests\test_threat_intel.py -q   # threat-intel tests (fake ATI + NVD, no network)
 ```
 
 `run.ps1` and `dev.ps1` reload PATH from the machine/user environment (VS Code terminals can have a stale PATH
@@ -67,6 +70,14 @@ running on 8080; check before starting another one, and don't stop processes you
   per-environment frontend config and no CORS. In dev, Vite proxies `/api` to :8000; in run mode `app/main.py`
   serves `frontend/dist` with an SPA fallback. On a hosted server nginx (`deploy/nginx.conf`) only adds HTTPS.
   Agents choose the server via `ServerUrl` / `ApiKey` in their `config.ini`.
+- **Threat intelligence is optional and separate.** ATI is another repo/app (own DB, own port, use 8001): talk to it
+  only over HTTP via `AtiClient`; never copy its code in (it has no license file). ATI supplies candidate CVEs and risk
+  data (`GET /api/cves?search=`). **Affected version ranges must come from NVD (`NvdClient`), never from ATI's
+  `vuln-version` endpoint**: it returns only the first bound, which flagged PostgreSQL 16.2 as safe. `threat_matches` is
+  keyed by application (name + version) and joined to each machine's current software at read time, so it holds no
+  machine ids and is fully rebuilt by every scan (`run_scan` replaces all rows except those of applications whose ATI
+  search failed). Unknown or undecidable is `review`, never `ruled_out`. A scan must never overwrite findings when ATI is
+  down. Tests use `httpx.MockTransport` for both ATI and NVD; `conftest._clean` also truncates the threat tables.
 - **Sync stack.** SQLAlchemy 2 sync + psycopg 3, sync FastAPI routes (thread pool).
 - **Tests** derive their DB from `DATABASE_URL` + `_test` (`tests/conftest.py`), point `app.db` at it via
   `db.configure()`, and truncate `machines CASCADE` before each test. Never point tests at the real DB.

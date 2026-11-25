@@ -27,6 +27,17 @@ class Settings(BaseSettings):
     agent_db_url: str = ""
     agent_poll_minutes: int = 30
 
+    # Advanced-Threat-Intelligence (ATI) integration (services/threat_intel.py). ATI runs as its own app; this server
+    # reads CVE intelligence from its HTTP API and matches it against the installed software. Empty URL = disabled.
+    ati_url: str = ""                 # e.g. http://127.0.0.1:8001
+    ati_poll_minutes: int = 60        # how often the match run repeats (0 = only when started from the dashboard)
+    ati_timeout_seconds: int = 60
+    # Exact affected version ranges come straight from NVD (ATI only exposes the first bound of each CVE).
+    nvd_url: str = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+    nvd_api_key: str = ""             # optional; raises NVD's limit from 5 to 50 requests per 30 s
+    nvd_max_lookups: int = 15         # NVD requests per scan (riskiest CVEs first); the rest wait for the next scan
+    nvd_range_ttl_days: int = 7       # how long a CVE's looked-up ranges are reused
+
     frontend_dist: Path = REPO_ROOT / "frontend" / "dist"
 
 

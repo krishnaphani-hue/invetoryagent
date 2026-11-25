@@ -10,7 +10,8 @@ import AppsIcon from '@mui/icons-material/AppsOutlined'
 import WarningIcon from '@mui/icons-material/GppMaybeOutlined'
 import HistoryIcon from '@mui/icons-material/HistoryOutlined'
 import ClearIcon from '@mui/icons-material/FilterAltOffOutlined'
-import { type StatsFilters, useMachines, useStats } from '../api'
+import SecurityIcon from '@mui/icons-material/SecurityOutlined'
+import { type StatsFilters, useMachines, useStats, useThreatStatus, useVulnSummary } from '../api'
 import { CardGrid, ErrorBox, Loading, PageHeader, SourceChip, StatCard } from '../components/common'
 import { timeAgo } from '../format'
 
@@ -101,6 +102,8 @@ function FilterBar({ filters, onChange }: { filters: StatsFilters; onChange: (pa
 export default function Dashboard() {
   const [filters, setFilters] = useDashboardFilters()
   const { data, isLoading, isFetching, error } = useStats(filters)
+  const threat = useThreatStatus()
+  const vulns = useVulnSummary()
   const filtered = isFiltered(filters)
   const period = PERIODS.find((p) => p.hours === filters.hours) ?? PERIODS[0]
   const empty = filtered ? 'Nothing matches the filters.' : 'No data yet.'
@@ -132,6 +135,12 @@ export default function Dashboard() {
         <StatCard label="Unique applications" value={data.unique_apps} icon={<AppsIcon />} />
         <StatCard label="Exposed ports" value={data.exposed_ports} hint="listening on a non-loopback address" icon={<WarningIcon />} />
         <StatCard label={`Snapshots (${period.short})`} value={data.snapshots_recent} icon={<HistoryIcon />} />
+        {threat.data?.enabled && vulns.data && (
+          <Link component={RouterLink} to="/vulnerabilities" underline="none" color="inherit">
+            <StatCard label="Vulnerable software" value={vulns.data.vulnerable}
+                      hint={`${vulns.data.machines} machines · ${vulns.data.kev} CISA KEV · all machines`} icon={<SecurityIcon />} />
+          </Link>
+        )}
       </CardGrid>
 
       <Box sx={{ display: 'grid', gap: 2, mt: 2, gridTemplateColumns: { xs: '1fr', lg: '1fr 1fr' } }}>

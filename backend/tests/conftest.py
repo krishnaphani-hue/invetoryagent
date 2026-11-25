@@ -38,7 +38,7 @@ def _test_database():
 @pytest.fixture(autouse=True)
 def _clean():
     with db.engine.begin() as conn:
-        conn.execute(text("TRUNCATE machines RESTART IDENTITY CASCADE"))
+        conn.execute(text("TRUNCATE machines, threat_matches, threat_cve_ranges RESTART IDENTITY CASCADE"))
     yield
 
 
